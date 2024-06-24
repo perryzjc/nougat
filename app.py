@@ -5,187 +5,135 @@ This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 """
 import argparse
-import os
-import sys
+import logging
+import re
 from functools import partial
 from http import HTTPStatus
-from typing import Optional
-
-from fastapi import FastAPI, File, UploadFile
-from PIL import Image
 from pathlib import Path
-import hashlib
-from fastapi.middleware.cors import CORSMiddleware
-import pypdfium2
+
 import torch
+from fastapi import FastAPI, File, Form, Query, UploadFile
 from nougat import NougatModel
-from nougat.postprocessing import markdown_compatible, close_envs
-from nougat.utils.dataset import ImageDataset
-from nougat.utils.checkpoint import get_checkpoint
-from nougat.dataset.rasterize import rasterize_paper
-from nougat.utils.device import move_to_device, default_batch_size
+from nougat.postprocessing import markdown_compatible
 from nougat.utils.args import get_common_args
+from nougat.utils.checkpoint import get_checkpoint
+from nougat.utils.dataset import LazyDataset
+from nougat.utils.device import move_to_device
+from pydantic import BaseModel
+from torch.utils.data import ConcatDataset
 from tqdm import tqdm
+import pypdf
+
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
 
 
-SAVE_DIR = Path("./pdfs")
-BATCHSIZE = int(os.environ.get("NOUGAT_BATCHSIZE", default_batch_size()))
-NOUGAT_CHECKPOINT = get_checkpoint()
-if NOUGAT_CHECKPOINT is None:
-    print(
-        "Set environment variable 'NOUGAT_CHECKPOINT' with a path to the model checkpoint!"
-    )
-    sys.exit(1)
-
-app = FastAPI(title="Nougat API")
-origins = ["http://localhost", "http://127.0.0.1"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-model = None
+class PDFResponse(BaseModel):
+    content: str
 
 
-@app.on_event("startup")
-async def load_model():
-    global model, BATCHSIZE
+class HealthCheckResponse(BaseModel):
+    status_code: int
+    data: dict
+
+
+def get_args():
     parser = argparse.ArgumentParser()
     parser = get_common_args(parser)
-    parser.add_argument("--port", "-p", type=int, default=8503, help="Port to run the server on.")
+    parser.add_argument("--port", type=int, default=8503, help="Port for the API server.")
     args = parser.parse_args()
-
     if args.checkpoint is None or not args.checkpoint.exists():
         args.checkpoint = get_checkpoint(args.checkpoint, model_tag=args.model)
-
-    if model is None:
-        model = NougatModel.from_pretrained(args.checkpoint)
-        model = move_to_device(model, bf16=not args.full_precision, cuda=args.batchsize > 0)
-        if args.batchsize <= 0:
-            args.batchsize = 1
-        BATCHSIZE = args.batchsize
-        model.eval()
+    if args.batchsize <= 0:
+        args.batchsize = 1
+    return args
 
 
-@app.get("/")
-def root():
-    """Health check."""
+def process_pdf(model, pdf_path, pages=None):
+    if not pdf_path.exists():
+        return None
+    try:
+        dataset = LazyDataset(
+            str(pdf_path.resolve()),
+            partial(model.encoder.prepare_input, random_padding=False),
+            pages,
+        )
+    except pypdf.errors.PdfStreamError:
+        logging.info(f"Could not load file {str(pdf_path)}.")
+        return None
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batchsize,
+        shuffle=False,
+        collate_fn=LazyDataset.ignore_none_collate,
+    )
+    predictions = []
+    page_num = 0
+    for i, (sample, is_last_page) in enumerate(tqdm(dataloader)):
+        model_output = model.inference(
+            image_tensors=sample, early_stopping=args.skipping
+        )
+        for j, output in enumerate(model_output["predictions"]):
+            if page_num == 0:
+                logging.info(
+                    "Processing file %s with %i pages" % (pdf_path.name, dataset.size)
+                )
+            page_num += 1
+            if output.strip() == "[MISSING_PAGE_POST]":
+                predictions.append(f"\n\n[MISSING_PAGE_EMPTY:{page_num}]\n\n")
+            elif args.skipping and model_output["repeats"][j] is not None:
+                if model_output["repeats"][j] > 0:
+                    logging.warning(f"Skipping page {page_num} due to repetitions.")
+                    predictions.append(f"\n\n[MISSING_PAGE_FAIL:{page_num}]\n\n")
+                else:
+                    predictions.append(
+                        f"\n\n[MISSING_PAGE_EMPTY:{i*args.batchsize+j+1}]\n\n"
+                    )
+            else:
+                if args.markdown:
+                    output = markdown_compatible(output)
+                predictions.append(output)
+    out = "".join(predictions).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+
+@app.get("/", response_model=HealthCheckResponse)
+def health_check():
+    """Health check endpoint."""
     response = {
-        "status-code": HTTPStatus.OK,
+        "status_code": HTTPStatus.OK,
         "data": {},
     }
     return response
 
 
-@app.post("/predict/")
+@app.post("/predict", response_model=PDFResponse)
 async def predict(
-    file: UploadFile = File(...), start: int = None, stop: int = None, recompute: Optional[bool] = False
-) -> str:
-    """
-    Perform predictions on a PDF document and return the extracted text in Markdown format.
-
-    Args:
-        file (UploadFile): The uploaded PDF file to process.
-        start (int, optional): The starting page number for prediction.
-        stop (int, optional): The ending page number for prediction.
-        recompute (bool, optional): Whether to recompute the predictions even if they exist.
-
-    Returns:
-        str: The extracted text in Markdown format.
-    """
-    pdfbin = file.file.read()
-    pdf = pypdfium2.PdfDocument(pdfbin)
-    md5 = hashlib.md5(pdfbin).hexdigest()
-    save_path = SAVE_DIR / md5
-
-    if start is not None and stop is not None:
-        pages = list(range(start - 1, stop))
-    else:
-        pages = list(range(len(pdf)))
-    predictions = [""] * len(pages)
-    dellist = []
-    if save_path.exists() and not recompute:
-        for computed in (save_path / "pages").glob("*.mmd"):
-            try:
-                idx = int(computed.stem) - 1
-                if idx in pages:
-                    i = pages.index(idx)
-                    print("skip page", idx + 1)
-                    predictions[i] = computed.read_text(encoding="utf-8")
-                    dellist.append(idx)
-            except Exception as e:
-                print(e)
-    compute_pages = pages.copy()
-    for el in dellist:
-        compute_pages.remove(el)
-    images = rasterize_paper(pdf, pages=compute_pages)
-    global model
-
-    dataset = ImageDataset(
-        images,
-        partial(model.encoder.prepare_input, random_padding=False),
-    )
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=BATCHSIZE,
-        pin_memory=True,
-        shuffle=False,
-    )
-
-    for idx, sample in tqdm(enumerate(dataloader), total=len(dataloader)):
-        if sample is None:
-            continue
-        model_output = model.inference(image_tensors=sample)
-        for j, output in enumerate(model_output["predictions"]):
-            if model_output["repeats"][j] is not None:
-                if model_output["repeats"][j] > 0:
-                    disclaimer = "\n\n+++ ==WARNING: Truncated because of repetitions==\n%s\n+++\n\n"
-                else:
-                    disclaimer = (
-                        "\n\n+++ ==ERROR: No output for this page==\n%s\n+++\n\n"
-                    )
-                rest = close_envs(model_output["repetitions"][j]).strip()
-                if len(rest) > 0:
-                    disclaimer = disclaimer % rest
-                else:
-                    disclaimer = ""
-            else:
-                disclaimer = ""
-
-            predictions[pages.index(compute_pages[idx * BATCHSIZE + j])] = (
-                markdown_compatible(output) + disclaimer
-            )
-
-    (save_path / "pages").mkdir(parents=True, exist_ok=True)
-    pdf.save(save_path / "doc.pdf")
-    if len(images) > 0:
-        thumb = Image.open(images[0])
-        thumb.thumbnail((400, 400))
-        thumb.save(save_path / "thumb.jpg")
-    for idx, page_num in enumerate(pages):
-        (save_path / "pages" / ("%02d.mmd" % (page_num + 1))).write_text(
-            predictions[idx], encoding="utf-8"
-        )
-    final = "".join(predictions).strip()
-    (save_path / "doc.mmd").write_text(final, encoding="utf-8")
-    return final
+    file: UploadFile = File(...),
+    pages: str = Query(None),
+):
+    pdf_path = Path(file.filename)
+    with pdf_path.open("wb") as f:
+        f.write(await file.read())
+    if pages:
+        pages = [int(p) - 1 for p in pages.split(",")]
+    result = process_pdf(model, pdf_path, pages)
+    pdf_path.unlink()
+    if result is None:
+        return {"content": "Failed to process PDF."}
+    return {"content": result}
 
 
 def main():
+    global args, model
+    args = get_args()
+    model = NougatModel.from_pretrained(args.checkpoint)
+    model = move_to_device(model, bf16=not args.full_precision, cuda=args.batchsize > 0)
+    model.eval()
     import uvicorn
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", "-p", type=int, default=8503, help="Port to run the server on.")
-    parser = get_common_args(parser)
-    args = parser.parse_args()
-
-    if args.checkpoint is None or not args.checkpoint.exists():
-        args.checkpoint = get_checkpoint(args.checkpoint, model_tag=args.model)
-
-    uvicorn.run("app:app", port=args.port)
+    uvicorn.run(app, port=args.port)
 
 
 if __name__ == "__main__":
