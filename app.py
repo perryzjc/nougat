@@ -175,7 +175,11 @@ def main():
     import uvicorn
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", "-p", type=int, default=8503, help="Port to run the server on.")
-    args = get_common_args(parser)  # Assign the returned args to a variable
+    parser = get_common_args(parser)
+    args = parser.parse_args()
+
+    if args.checkpoint is None or not args.checkpoint.exists():
+        args.checkpoint = get_checkpoint(args.checkpoint, model_tag=args.model)
 
     uvicorn.run("app:app", port=args.port)
 

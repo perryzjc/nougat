@@ -52,9 +52,4 @@ def get_common_args(parser):
         action="store_false",
         help="Don't apply failure detection heuristic.",
     )
-    args = parser.parse_args()
-
-    if args.checkpoint is None or not args.checkpoint.exists():
-        args.checkpoint = get_checkpoint(args.checkpoint, model_tag=args.model)
-
-    return args
+    return parser
