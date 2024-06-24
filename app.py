@@ -55,6 +55,7 @@ async def load_model():
     global model, BATCHSIZE
     parser = argparse.ArgumentParser()
     parser = get_common_args(parser)
+    parser.add_argument("--port", "-p", type=int, default=8503, help="Port to run the server on.")
     args = parser.parse_args()
 
     if model is None:
