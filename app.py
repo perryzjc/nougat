@@ -175,8 +175,7 @@ def main():
     import uvicorn
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", "-p", type=int, default=8503, help="Port to run the server on.")
-    parser = get_common_args(parser)
-    args = parser.parse_args()
+    args = get_common_args(parser)  # Assign the returned args to a variable
 
     uvicorn.run("app:app", port=args.port)
 
