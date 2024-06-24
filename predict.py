@@ -20,6 +20,7 @@ from nougat.utils.dataset import LazyDataset
 from nougat.utils.device import move_to_device, default_batch_size
 from nougat.utils.checkpoint import get_checkpoint
 from nougat.postprocessing import markdown_compatible
+from nougat.utils.args import get_common_args
 import pypdf
 
 logging.basicConfig(level=logging.INFO)
@@ -27,55 +28,8 @@ logging.basicConfig(level=logging.INFO)
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--batchsize",
-        "-b",
-        type=int,
-        default=default_batch_size(),
-        help="Batch size to use.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        "-c",
-        type=Path,
-        default=None,
-        help="Path to checkpoint directory.",
-    )
-    parser.add_argument(
-        "--model",
-        "-m",
-        type=str,
-        default="0.1.0-small",
-        help=f"Model tag to use.",
-    )
+    parser = get_common_args(parser)
     parser.add_argument("--out", "-o", type=Path, help="Output directory.")
-    parser.add_argument(
-        "--recompute",
-        action="store_true",
-        help="Recompute already computed PDF, discarding previous predictions.",
-    )
-    parser.add_argument(
-        "--full-precision",
-        action="store_true",
-        help="Use float32 instead of bfloat16. Can speed up CPU conversion for some setups.",
-    )
-    parser.add_argument(
-        "--no-markdown",
-        dest="markdown",
-        action="store_false",
-        help="Do not add postprocessing step for markdown compatibility.",
-    )
-    parser.add_argument(
-        "--markdown",
-        action="store_true",
-        help="Add postprocessing step for markdown compatibility (default).",
-    )
-    parser.add_argument(
-        "--no-skipping",
-        dest="skipping",
-        action="store_false",
-        help="Don't apply failure detection heuristic.",
-    )
     parser.add_argument(
         "--pages",
         "-p",

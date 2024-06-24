@@ -4,10 +4,13 @@ Copyright (c) Meta Platforms, Inc. and affiliates.
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 """
+import argparse
 import os
 import sys
 from functools import partial
 from http import HTTPStatus
+from typing import Optional
+
 from fastapi import FastAPI, File, UploadFile
 from PIL import Image
 from pathlib import Path
@@ -21,6 +24,7 @@ from nougat.utils.dataset import ImageDataset
 from nougat.utils.checkpoint import get_checkpoint
 from nougat.dataset.rasterize import rasterize_paper
 from nougat.utils.device import move_to_device, default_batch_size
+from nougat.utils.args import get_common_args
 from tqdm import tqdm
 
 
@@ -47,15 +51,18 @@ model = None
 
 
 @app.on_event("startup")
-async def load_model(
-    checkpoint: str = NOUGAT_CHECKPOINT,
-):
+async def load_model():
     global model, BATCHSIZE
+    parser = argparse.ArgumentParser()
+    parser = get_common_args(parser)
+    args = parser.parse_args()
+
     if model is None:
-        model = NougatModel.from_pretrained(checkpoint)
-        model = move_to_device(model, cuda=BATCHSIZE > 0)
-        if BATCHSIZE <= 0:
-            BATCHSIZE = 1
+        model = NougatModel.from_pretrained(args.checkpoint)
+        model = move_to_device(model, bf16=not args.full_precision, cuda=args.batchsize > 0)
+        if args.batchsize <= 0:
+            args.batchsize = 1
+        BATCHSIZE = args.batchsize
         model.eval()
 
 
@@ -71,7 +78,7 @@ def root():
 
 @app.post("/predict/")
 async def predict(
-    file: UploadFile = File(...), start: int = None, stop: int = None
+    file: UploadFile = File(...), start: int = None, stop: int = None, recompute: Optional[bool] = False
 ) -> str:
     """
     Perform predictions on a PDF document and return the extracted text in Markdown format.
@@ -80,6 +87,7 @@ async def predict(
         file (UploadFile): The uploaded PDF file to process.
         start (int, optional): The starting page number for prediction.
         stop (int, optional): The ending page number for prediction.
+        recompute (bool, optional): Whether to recompute the predictions even if they exist.
 
     Returns:
         str: The extracted text in Markdown format.
@@ -95,7 +103,7 @@ async def predict(
         pages = list(range(len(pdf)))
     predictions = [""] * len(pages)
     dellist = []
-    if save_path.exists():
+    if save_path.exists() and not recompute:
         for computed in (save_path / "pages").glob("*.mmd"):
             try:
                 idx = int(computed.stem) - 1
@@ -165,8 +173,11 @@ async def predict(
 
 def main():
     import uvicorn
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", "-p", type=int, default=8503, help="Port to run the server on.")
+    args = parser.parse_args()
 
-    uvicorn.run("app:app", port=8503)
+    uvicorn.run("app:app", port=args.port)
 
 
 if __name__ == "__main__":
