@@ -58,6 +58,9 @@ async def load_model():
     parser.add_argument("--port", "-p", type=int, default=8503, help="Port to run the server on.")
     args = parser.parse_args()
 
+    if args.checkpoint is None or not args.checkpoint.exists():
+        args.checkpoint = get_checkpoint(args.checkpoint, model_tag=args.model)
+
     if model is None:
         model = NougatModel.from_pretrained(args.checkpoint)
         model = move_to_device(model, bf16=not args.full_precision, cuda=args.batchsize > 0)
