@@ -1,9 +1,3 @@
-"""
-Copyright (c) Meta Platforms, Inc. and affiliates.
-
-This source code is licensed under the MIT license found in the
-LICENSE file in the root directory of this source tree.
-"""
 import argparse
 import logging
 import re
@@ -26,6 +20,7 @@ import pypdf
 
 logging.basicConfig(level=logging.INFO)
 
+model = None
 app = FastAPI()
 
 
@@ -44,13 +39,14 @@ def get_args():
     parser.add_argument("--port", type=int, default=8503, help="Port for the API server.")
     args = parser.parse_args()
     if args.checkpoint is None or not args.checkpoint.exists():
-        args.checkpoint = get_checkpoint(args.checkpoint, model_tag=args.model)
+        # args.checkpoint = get_checkpoint(args.checkpoint, model_tag=args.model)
+        args.checkpoint = get_checkpoint(args.checkpoint, model_tag="0.1.0-base")
     if args.batchsize <= 0:
         args.batchsize = 1
     return args
 
 
-def process_pdf(model, pdf_path, pages=None):
+def process_pdf(pdf_path, pages=None):
     if not pdf_path.exists():
         return None
     try:
@@ -119,7 +115,7 @@ async def predict(
         f.write(await file.read())
     if pages:
         pages = [int(p) - 1 for p in pages.split(",")]
-    result = process_pdf(model, pdf_path, pages)
+    result = process_pdf(pdf_path, pages)
     pdf_path.unlink()
     if result is None:
         return {"content": "Failed to process PDF."}
